@@ -29,4 +29,12 @@ public interface DataObjectRepository extends JpaRepository<DataObject, Long> {
      */
     @Query("select o.id from DataObject o where o.businessKey = :businessKey")
     Optional<Long> findIdByBusinessKey(@Param("businessKey") String businessKey);
+
+    /**
+     * 范围计算分批扫描：按 ID 升序取游标之后的一批，条件过滤在内存完成，
+     * 避免动态拼接 JPQL；调用方保存新游标后可安全重试/续算。
+     */
+    @Query("select o from DataObject o where o.id > :cursorId order by o.id asc")
+    List<DataObject> findBatchAfterId(@Param("cursorId") long cursorId,
+                                      org.springframework.data.domain.Pageable pageable);
 }

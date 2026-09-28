@@ -3,6 +3,7 @@ package com.chris64233.cc.legalhold.web;
 import com.chris64233.cc.legalhold.service.ConflictException;
 import com.chris64233.cc.legalhold.service.DeletionBlockedException;
 import com.chris64233.cc.legalhold.service.NotFoundException;
+import com.chris64233.cc.legalhold.service.scope.ScopeRejectedException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -20,10 +21,17 @@ public class ApiExceptionHandler {
         return build(HttpStatus.NOT_FOUND, ex.getMessage(), List.of());
     }
 
-    @ExceptionHandler({ConflictException.class, DeletionBlockedException.class})
+    @ExceptionHandler({ConflictException.class, DeletionBlockedException.class,
+            ScopeRejectedException.class})
     public ResponseEntity<Map<String, Object>> handleConflict(RuntimeException ex) {
-        List<String> reasons = ex instanceof DeletionBlockedException blocked
-                ? blocked.getReasons() : List.of(ex.getMessage());
+        List<String> reasons;
+        if (ex instanceof DeletionBlockedException blocked) {
+            reasons = blocked.getReasons();
+        } else if (ex instanceof ScopeRejectedException rejected) {
+            reasons = rejected.getReasons();
+        } else {
+            reasons = List.of(ex.getMessage());
+        }
         return build(HttpStatus.CONFLICT, ex.getMessage(), reasons);
     }
 
@@ -34,6 +42,14 @@ public class ApiExceptionHandler {
                 .map(error -> error.getField() + ": " + error.getDefaultMessage())
                 .toList();
         return build(HttpStatus.BAD_REQUEST, "请求参数校验失败", reasons);
+    }
+
+    @ExceptionHandler(org.springframework.dao.DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String, Object>> handleDataIntegrity(
+            org.springframework.dao.DataIntegrityViolationException ex) {
+        // 并发下唯一约束兜底：重复变更业务号、同人重复审批等返回 409 而非 500。
+        return build(HttpStatus.CONFLICT, "操作冲突，可能为重复提交或并发变更",
+                List.of(String.valueOf(ex.getMostSpecificCause().getMessage())));
     }
 
     private ResponseEntity<Map<String, Object>> build(HttpStatus status, String message,
