@@ -39,6 +39,66 @@
   约束防止重复保全，同一案件重复纳入幂等跳过。
 - 只有全部有效保全都解除后，对象才可能满足删除条件。
 
+### 案件范围版本化（不可变版本）
+
+- 案件范围按**对象标识、类别、创建时间区间**三类条件的并集生成：命中显式
+  `businessKeys`，或类别命中 `categories` 且创建时间落在
+  `[createdFrom, createdTo)`（边界可空表示不限）的对象进入目标范围。
+- 每次扩大或缩小范围都**创建一个新版本**（`case_scope_version`，案件内版本号
+  递增），旧版本永不覆盖、永不修改；目标集合物化为不可变的
+  `case_scope_member` 快照，并按相对基准版本标记 `ADDED / RETAINED / REMOVED`。
+- 版本状态机：`PENDING_MATERIALIZE`（分批计算中，对外不可见）→
+  纯扩围直接 `EFFECTIVE`；存在移除对象（`SHRINK`）或关闭案件（`CLOSE`，
+  目标范围为空集）→ `PENDING_APPROVAL` → `EFFECTIVE` 或 `REJECTED`；
+  被更新生效版本取代的旧版本置为 `SUPERSEDED`。案件任一时刻只有一个
+  `EFFECTIVE` 版本，对外只能看到完整生效的范围。
+- 与目标范围完全一致（无新增也无移除）的变更直接判为 `REJECTED`，不占用案件，
+  也不触碰任何保全。
+
+### 双人审批与释放前最终复核
+
+- 缩小范围、关闭案件都必须由**两名互不相同、且都不是申请人**的人员分别
+  `APPROVE`；同一审批人重复投票幂等，只计一票。任一人 `REJECT` 立即整批拒绝。
+- 进入待审批时，对每个待释放对象写入**约束快照**（其他案件保全清单、保留规则
+  天数与届满状态、案件当前生效版本号、本案保全是否仍在）。
+- 第二名批准触发**最终确认**：在同一事务内对每个待释放对象重新核验，期间出现
+  其他案件保全、保留规则或届满状态变化、案件当前版本变化、本案保全已不存在等
+  任一情况，都判定“条件变化”，**整批拒绝**——一个对象都不释放。
+- 复核通过后才删除 `hold_membership` 并为每个对象追加 `RELEASE` 事件（含变更
+  业务号与版本号）；关闭案件同时置 `closed`，之后不得再变更范围。
+
+### 大批量分批计算、安全重试与原子可见性
+
+- 范围计算按对象 ID 键集分页，每批一个**独立短事务**提交，游标记录在版本行
+  （`materialize_after_id` / `removed_after_id`），目标对象 ID 高水位在变更
+  开始时固化，保证重试扫描的是同一集合。
+- 每批写入都靠 `(版本, 对象)` 唯一约束去重；执行失败或服务重启后，用**同一
+  变更业务号重复提交**或调用 `resume` 即可安全续跑，不产生重复成员、重复保全。
+- 物化完成前版本一直是 `PENDING_MATERIALIZE`，对外不生效；生效（建立/释放保全）
+  在定稿事务内整批完成。因此绝不会出现“只有部分对象被保全或释放”的中间态。
+- 批大小与单调用批次数可配：
+  `legalhold.scope.materialize-batch-size`（默认 500）、
+  `legalhold.scope.max-batches-per-call`（默认 20）。
+
+### 范围变更的幂等与并发安全
+
+- 每个变更由客户端提供唯一**变更业务号 `changeNo`**（数据库唯一约束）。重复
+  提交只会续跑/返回同一个版本（响应中 `idempotentReplay=true`），绝不产生第二个
+  版本或重复效果；同一 `changeNo` 不能用于不同案件。
+- 每个审批事件按 `(changeNo, reviewer, vote)` 唯一约束幂等。
+- 所有范围变更与审批生效都先对**案件行加悲观写锁**，同案件的并发扩围、缩围与
+  关闭严格串行：一个变更未终结（仍在物化或待审批）时，其他变更返回 409。
+- 生效时再按对象 ID 升序对对象行加悲观写锁、对保留规则行加锁，与删除确认、规则
+  更新串行。因此并发扩围/缩围/删除确认下，处于有效保全范围内的对象绝不会被删除
+  （见 `ScopeConcurrencyTest`）。
+
+### 范围相关查询
+
+- 版本差异：任意两个版本间的新增/移除/保留对象（默认对比相邻版本）。
+- 对象所受全部保全：跨案件列出，含建立该保全的范围版本与案件是否已关闭。
+- 释放原因：对象被各案件释放的 `RELEASE` 事件（变更业务号、版本号、原因、时间）。
+- 审批进度：所需批准数、已批准的不同人员、全部投票事件、拒绝原因。
+
 ### 两阶段删除
 
 1. 申请：服务端重新计算保留期并检查有效保全。任一条件不满足返回 409 及阻断原因；
@@ -76,6 +136,17 @@
 | POST | `/api/legal-holds/release` | 案件解除对多个对象的保全 |
 | POST | `/api/deletions/request/{businessKey}` | 申请删除，返回一次性令牌和过期时间 |
 | POST | `/api/deletions/confirm/{token}` | 确认删除；重复确认返回原结果 |
+| POST | `/api/case-scopes/changes` | 提交范围变更（body：`caseNo`,`changeNo`,`reason`,`createdBy`,`criteria`）；扩围/缩围自动判定，`changeNo` 幂等 |
+| POST | `/api/case-scopes/close` | 关闭案件（目标范围为空，整案释放，双人审批） |
+| POST | `/api/case-scopes/changes/{changeNo}/resume` | 续跑大批量物化（分批执行/重启恢复），幂等 |
+| POST | `/api/case-scopes/approvals` | 提交审批事件（`changeNo`,`reviewer`,`vote=APPROVE/REJECT`,`comment`）；事件幂等 |
+| GET | `/api/case-scopes/{caseNo}/versions` | 案件的全部不可变版本 |
+| GET | `/api/case-scopes/{caseNo}/versions/current` | 当前唯一生效版本 |
+| GET | `/api/case-scopes/{caseNo}/versions/{versionNo}` | 指定版本详情（含条件快照与增/留/删计数） |
+| GET | `/api/case-scopes/{caseNo}/diff?from=&to=` | 版本差异（新增/移除/保留对象），缺省对比相邻版本 |
+| GET | `/api/case-scopes/changes/{changeNo}/approval-progress` | 审批进度：所需/已批人数、审批人、投票事件、拒绝原因 |
+| GET | `/api/case-scopes/objects/{businessKey}/holds` | 对象当前受到的全部保全（跨案件、含版本与案件关闭标记） |
+| GET | `/api/case-scopes/objects/{businessKey}/release-reasons` | 对象被各案件释放的原因列表 |
 
 资格被保留期或保全阻断时返回 `409 Conflict`，响应体 `reasons` 给出全部阻断原因。
 
@@ -88,4 +159,15 @@
   令牌过期均拒绝并失效令牌、重新申请作废旧令牌、审计仅写一次。
 - `HoldDeletionConcurrencyTest`：多线程并发“保全加入 vs 删除确认”，断言绝不出现
   有效保全与 `DELETED` 并存。
+- `CaseScopeServiceTest`：按条件生成不可变版本、新旧版本并存与差异、扩围即时生效、
+  缩围/关案双人不同人员批准、申请人不能自批、单人拒绝整批拒绝、最终复核发现保留
+  规则变化或新增其他案件保全时整批拒绝、`changeNo` 与审批事件幂等、同案并发变更
+  互斥、空范围拒绝、已删除对象不入范围。
+- `ScopeBatchResumeTest`：批大小为 2、单调用只跑一批，验证大批扩围/缩围跨多批
+  续跑、重启后用同一 `changeNo` 安全重试不重复、物化期间绝不部分释放、双人批准后
+  整批释放。
+- `ScopeConcurrencyTest`：多线程并发“关闭生效（整批释放）vs 删除申请/确认”，
+  断言处于有效保全范围内的对象绝不会被删除，整批拒绝时所有对象仍受保全。
+- `CaseScopeControllerTest`：范围变更/双人审批/差异/审批进度/对象保全与释放原因
+  的 HTTP 端到端流程、幂等重放标记、申请人自批 409、空条件 409。
 - `DeletionFlowControllerTest`：HTTP 层端到端流程、409 阻断解释、参数校验。

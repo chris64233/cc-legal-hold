@@ -13,6 +13,7 @@ import java.time.Instant;
 
 /**
  * 法律保全操作事件。每次纳入/解除保全生成一条，写入后不可修改。
+ * 范围版本生效时记录变更业务号与版本号，便于按对象追溯释放原因。
  */
 @Entity
 @Table(name = "hold_event", uniqueConstraints = {
@@ -44,17 +45,30 @@ public class HoldEvent {
     @Column(name = "effective_at", nullable = false, updatable = false)
     private Instant effectiveAt;
 
+    @Column(name = "change_no", updatable = false, length = 64)
+    private String changeNo;
+
+    @Column(name = "version_no", updatable = false)
+    private Integer versionNo;
+
     protected HoldEvent() {
     }
 
     public HoldEvent(String eventNo, String caseNo, HoldEventType eventType, Long objectId,
                      String reason, Instant effectiveAt) {
+        this(eventNo, caseNo, eventType, objectId, reason, effectiveAt, null, null);
+    }
+
+    public HoldEvent(String eventNo, String caseNo, HoldEventType eventType, Long objectId,
+                     String reason, Instant effectiveAt, String changeNo, Integer versionNo) {
         this.eventNo = eventNo;
         this.caseNo = caseNo;
         this.eventType = eventType;
         this.objectId = objectId;
         this.reason = reason;
         this.effectiveAt = effectiveAt;
+        this.changeNo = changeNo;
+        this.versionNo = versionNo;
     }
 
     public Long getId() {
@@ -83,5 +97,13 @@ public class HoldEvent {
 
     public Instant getEffectiveAt() {
         return effectiveAt;
+    }
+
+    public String getChangeNo() {
+        return changeNo;
+    }
+
+    public Integer getVersionNo() {
+        return versionNo;
     }
 }

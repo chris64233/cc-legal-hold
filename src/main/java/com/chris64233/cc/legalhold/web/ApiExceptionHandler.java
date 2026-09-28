@@ -6,6 +6,7 @@ import com.chris64233.cc.legalhold.service.NotFoundException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -20,10 +21,13 @@ public class ApiExceptionHandler {
         return build(HttpStatus.NOT_FOUND, ex.getMessage(), List.of());
     }
 
-    @ExceptionHandler({ConflictException.class, DeletionBlockedException.class})
+    @ExceptionHandler({ConflictException.class, DeletionBlockedException.class,
+            DataIntegrityViolationException.class})
     public ResponseEntity<Map<String, Object>> handleConflict(RuntimeException ex) {
         List<String> reasons = ex instanceof DeletionBlockedException blocked
-                ? blocked.getReasons() : List.of(ex.getMessage());
+                ? blocked.getReasons()
+                : List.of(ex instanceof DataIntegrityViolationException
+                        ? "并发冲突或唯一约束冲突，请用同一业务号重试" : ex.getMessage());
         return build(HttpStatus.CONFLICT, ex.getMessage(), reasons);
     }
 
